@@ -184,15 +184,22 @@ impl PingSession {
         mut rtt_rx: mpsc::UnboundedReceiver<Duration>,
     ) {
         let mut interval = interval(Duration::from_secs(1));
-        
+        let mut first_tick = true;
+
         while running.load(Ordering::SeqCst) {
             interval.tick().await;
 
             let mut stats = RttStats::new();
-            
+
             // Collect all RTT samples from the past second
             while let Ok(rtt) = rtt_rx.try_recv() {
                 stats.add_sample(rtt);
+            }
+
+            // Skip the first tick to avoid inaccurate initial statistics
+            if first_tick {
+                first_tick = false;
+                continue;
             }
 
             let sent = PACKETS_PER_SECOND;
