@@ -8,10 +8,22 @@ use std::net::{IpAddr, ToSocketAddrs};
 use tracing_subscriber;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "High-frequency ping tool for network monitoring",
+    long_about = "A high-frequency ping tool that sends 100 ICMP packets per second to monitor network latency and packet loss. Supports both IPv4 and IPv6 addresses."
+)]
 struct Args {
-    /// Target address to ping
+    /// Target address to ping (IP address or hostname)
     target: String,
+
+    /// Output file path for logging ping statistics
+    ///
+    /// When specified, ping statistics will be written to the file in addition to console output.
+    /// Each line contains one second of statistics. Maximum file size is 10MB.
+    #[arg(short = 'o', long = "output", help = "Write ping statistics to file (max 10MB)")]
+    output: Option<String>,
 }
 
 #[tokio::main]
@@ -31,8 +43,8 @@ async fn main() -> Result<()> {
     );
 
     // Create and start ping session
-    let session = ping::PingSession::new(target_ip);
-    
+    let session = ping::PingSession::new(target_ip, args.output)?;
+
     if let Err(e) = session.start().await {
         eprintln!("Ping session failed: {}", e);
 

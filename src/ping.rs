@@ -2,10 +2,12 @@ use crate::icmp::IcmpPacket;
 use crate::stats::RttStats;
 use anyhow::{Result, Context};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -14,23 +16,45 @@ use tracing::{debug, info, warn};
 const PACKETS_PER_SECOND: u64 = 100;
 const PACKET_INTERVAL_MS: u64 = 1000 / PACKETS_PER_SECOND;
 const PROCESS_ID: u16 = 12345;
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
 
 pub struct PingSession {
     target: IpAddr,
     is_ipv6: bool,
     sequence: Arc<AtomicU16>,
     running: Arc<AtomicBool>,
+    output_file: Option<Arc<Mutex<std::fs::File>>>,
+    file_size: Arc<Mutex<u64>>,
 }
 
 impl PingSession {
-    pub fn new(target: IpAddr) -> Self {
+    pub fn new(target: IpAddr, output_path: Option<String>) -> Result<Self> {
         let is_ipv6 = target.is_ipv6();
-        Self {
+
+        let (output_file, file_size) = if let Some(path) = output_path {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("Failed to open output file: {}", path))?;
+
+            let size = file.metadata()
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            (Some(Arc::new(Mutex::new(file))), Arc::new(Mutex::new(size)))
+        } else {
+            (None, Arc::new(Mutex::new(0)))
+        };
+
+        Ok(Self {
             target,
             is_ipv6,
             sequence: Arc::new(AtomicU16::new(1)),
             running: Arc::new(AtomicBool::new(true)),
-        }
+            output_file,
+            file_size,
+        })
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -74,8 +98,10 @@ impl PingSession {
 
         // Start reporter task
         let reporter_running = self.running.clone();
+        let reporter_output_file = self.output_file.clone();
+        let reporter_file_size = self.file_size.clone();
         let reporter_task = tokio::spawn(async move {
-            Self::reporter_task(reporter_running, rtt_rx).await
+            Self::reporter_task(reporter_running, rtt_rx, reporter_output_file, reporter_file_size).await
         });
 
         // Wait for Ctrl+C
@@ -182,12 +208,19 @@ impl PingSession {
     async fn reporter_task(
         running: Arc<AtomicBool>,
         mut rtt_rx: mpsc::UnboundedReceiver<Duration>,
+        output_file: Option<Arc<Mutex<std::fs::File>>>,
+        file_size: Arc<Mutex<u64>>,
     ) {
         let mut interval = interval(Duration::from_secs(1));
         let mut first_tick = true;
 
         while running.load(Ordering::SeqCst) {
             interval.tick().await;
+
+            // Check if we should stop before processing statistics
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
 
             let mut stats = RttStats::new();
 
@@ -202,6 +235,11 @@ impl PingSession {
                 continue;
             }
 
+            // Check again if we should stop before outputting statistics
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+
             let sent = PACKETS_PER_SECOND;
             let received = stats.count;
             let loss = if sent > 0 {
@@ -211,7 +249,7 @@ impl PingSession {
             };
 
             let now = chrono::Local::now();
-            println!(
+            let output_line = format!(
                 "[{}] Sent:{} Recv:{} Loss:{:.1}% | RTT min/avg/max: {:.1}/{:.1}/{:.1}ms",
                 now.format("%H:%M:%S"),
                 sent,
@@ -221,6 +259,28 @@ impl PingSession {
                 stats.average_ms(),
                 stats.max_ms()
             );
+
+            // Print to console
+            println!("{}", output_line);
+
+            // Write to file if specified
+            if let Some(ref file_arc) = output_file {
+                if let (Ok(mut file), Ok(mut size)) = (file_arc.try_lock(), file_size.try_lock()) {
+                    let line_with_newline = format!("{}\n", output_line);
+                    let line_bytes = line_with_newline.as_bytes();
+
+                    // Check if writing this line would exceed the file size limit
+                    if *size + line_bytes.len() as u64 <= MAX_FILE_SIZE {
+                        if let Ok(_) = file.write_all(line_bytes) {
+                            if let Ok(_) = file.flush() {
+                                *size += line_bytes.len() as u64;
+                            }
+                        }
+                    } else {
+                        warn!("Output file size limit ({}MB) reached, skipping file write", MAX_FILE_SIZE / 1024 / 1024);
+                    }
+                }
+            }
         }
     }
 }
